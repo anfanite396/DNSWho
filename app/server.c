@@ -9,57 +9,7 @@
 #include <sys/time.h>
 #include <arpa/inet.h>
 
-#define QR_MASK 	0x8000
-#define OPCODE_MASK 0x7800
-#define AA_MASK 	0x0400
-#define TC_MASK 	0x0200
-#define RD_MASK 	0x0100
-#define RA_MASK 	0x0080
-#define Z_MASK 		0x0070
-#define RCODE_MASK 	0x000F
-
-#define A_MASK 0x01
-#define NS_MASK 0x02
-#define CNAME_MASK 0x05
-#define AAAA_MASK 0x1c
-
-typedef struct{
-	uint16_t id;
-	uint16_t flags;
-	uint16_t qcount;
-	uint16_t ancount;
-	uint16_t nscount;
-	uint16_t arcount;
-} dns_header_t;
-
-typedef struct{
-	unsigned short type;
-	unsigned short class;
-} dns_query_info_t;
-
-typedef struct{
-	unsigned char *qname;
-	dns_query_info_t *qinfo;
-} dns_query_t;
-
-typedef struct{
-	uint8_t type;
-	uint8_t class;
-	uint16_t ttl;
-	uint8_t rdlength; 
-} dns_resource_data_t;
-
-typedef struct{
-	unsigned char *name;
-	dns_resource_data_t *resource;
-	unsigned char *rdata;
-} dns_resource_record_t;
-
-dns_resource_record_t* getHostByName(unsigned char* host, int qtype);
-dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest);
-void changeToDNSNameFormat(unsigned char *dns, unsigned char *host);
-void getDNSresolvers();
-unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, int *gain);
+#include "server.h"
 
 unsigned char dns_resolvers[10][256];
 unsigned char root_servers[13][256];
@@ -70,68 +20,124 @@ int main() {
  	setbuf(stderr, NULL);
 
 	// Start Logging the outputs
-    printf("Logs from your program will appear here!\n");
+    printf("Logs from this program will appear here!\n");
 
-	// Get the names of possible DNS resolvers
+	// Get the names of standard DNS resolvers and Root name servers
 	getDNSresolvers();
 
-	unsigned char host[256];
-	strcpy((char *)host, "www.google.com");
-	int qtype = 1;
-	getHostByName(host, qtype);
+	// unsigned char host[256];
+	// strcpy((char *)host, "academy.networkchuck.com");
+	// int qtype = 1;
+	// dns_resource_record_t *dns = getHostByName(host, qtype);
+	// if (dns != NULL)
+	// 	printf("The IP address of %s is : %s\n", host, dns->rdata);
 
-	// // Creating a UDP socket
-	// int socket_desc = socket(AF_INET, SOCK_DGRAM, 0);
-	// if (socket_desc == -1){
-	// 	printf("Socket creation failed : %s...\n", strerror(errno));
-	// 	return 1;
-	// }
+	// Creating a UDP socket
+	int socket_desc = socket(AF_INET, SOCK_DGRAM, 0);
+	if (socket_desc == -1){
+		printf("Socket creation failed : %s...\n", strerror(errno));
+		return 1;
+	}
 
-	// int reuse = 1;
-	// if (setsockopt(socket_desc, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0){
-	// 	printf("SO_REUSEPORT failed: %s...\n", strerror(errno));
-	// 	return 1;
-	// }
+	int reuse = 1;
+	if (setsockopt(socket_desc, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0){
+		printf("SO_REUSEPORT failed: %s...\n", strerror(errno));
+		return 1;
+	}
 
-	// struct sockaddr_in serv_addr;
-	// serv_addr.sin_family = AF_INET;
-	// serv_addr.sin_port = htons(2053);
-	// serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	struct sockaddr_in serv_addr;
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_port = htons(2053);
+	serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	// // Bind the socket to the address
-	// if (bind(socket_desc, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) != 0){
-	// 	printf("Bind failed : %s...\n", strerror(errno));
-	// 	return 1;
-	// }
+	// Bind the socket to the address
+	if (bind(socket_desc, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) != 0){
+		printf("Bind failed : %s...\n", strerror(errno));
+		return 1;
+	}
 
-	// int bytesRead;
-	// char buffer[512];
-	// struct sockaddr_in clientAddress;
-	// socklen_t clientAddrLen = sizeof(clientAddress);
+	int bytesRead;
+	unsigned char buf[65536], *qname;
+	dns_query_info_t *qinfo;
+	struct sockaddr_in clientAddress;
+	socklen_t clientAddrLen = sizeof(clientAddress);
 
-	// while(1){
-	// 	bytesRead = recvfrom(socket_desc, buffer, sizeof(buffer), 0, (struct sockaddr *) &clientAddress, &clientAddrLen);
-	// 	if (bytesRead == -1){
-	// 		perror("Error receiving data");
-	// 		break;
-	// 	}
+	while(1){
+		bytesRead = recvfrom(socket_desc, buf, 65536, 0, (struct sockaddr *) &clientAddress, &clientAddrLen);
+		if (bytesRead == -1){
+			perror("Error receiving data");
+			break;
+		}
 
-	// 	buffer[bytesRead] = '\0';
-	// 	printf("Received %d bytes : %s\n", bytesRead, buffer);
+		buf[bytesRead] = '\0';
+		printf("Received %d bytes : %s\n", bytesRead, buf);
 
-	// 	dns_message_t response = {0};
-	// 	response.header.id = htons(1234);
-	// 	response.header.flags |= QR_MASK;
-	// 	response.header.flags = htons(response.header.flags);
+		dns_header_t *header = (dns_header_t *) &buf;
+		qname = (unsigned char *) &buf[sizeof(header)];
+		qinfo = (dns_query_info_t *) &buf[sizeof(header) + strlen(qname) + 1];
 
-	// 	// Send response
-	// 	if (sendto(socket_desc, &response, sizeof(response), 0, (struct sockaddr *) &clientAddress, clientAddrLen) == -1){
-	// 		perror("Error sending response");
-	// 	}
-	// }
+		int size = sizeof(header) + strlen(qname) + 1 + sizeof(dns_query_info_t);
 
-	// close(socket_desc);
+		dns_resource_record_t *result = getHostByName(qname, ntohs(qinfo->type));
+
+		if (result == NULL){
+			// Hum pe to hai hi na, ask someone else
+			result = getHostFromResolver(qname, ntohs(qinfo->type));
+		}
+
+		if (result == NULL){
+			// If no one has it, then probably the domain itself if not valid
+			header->flags = 0;
+			header->flags |= 3; 	// Non-existent domain
+			header->flags |= QR_MASK;
+			header->flags |= RA_MASK;
+			header->flags = htons(header->flags);
+		}
+		else{
+			header->flags = 0;
+			header->flags |= QR_MASK;
+			header->flags |= RA_MASK;
+			header->flags = htons(header->flags);
+
+			header->qcount = 0;
+			header->ancount = ntohs(1);
+			header->nscount = 0;
+			header->arcount = 0;
+
+			dns_resource_record_t *answer = (dns_resource_record_t *) &buf[size];
+			strcpy(answer->name, qname);
+			size += strlen(qname) + 1;
+
+			memcpy(answer->resource, result->resource, sizeof(dns_resource_data_t));
+			size += sizeof(dns_resource_data_t);
+
+			memcpy(answer->name, result->rdata, INET_ADDRSTRLEN);	// Copy the whole encoded address
+			size += INET_ADDRSTRLEN;
+		}
+
+		// Send the response back
+		if (sendto(socket_desc, &buf, size, 0, (struct sockaddr *) & clientAddress, clientAddrLen) == -1){
+			perror("Error sending response");
+		}
+
+		printf("Query response sent successfully");
+
+		free(result);
+	}
+
+	close(socket_desc);
 	return 0;
+}
+
+dns_resource_record_t* getHostFromResolver(unsigned char *host, int qtype){
+	int i;
+	dns_resource_record_t *answer;
+	for (i = 0; i < 2; i++){
+		answer = getHostByNameAndDest(host, qtype, dns_resolvers[i]);
+		if (answer != NULL)
+			return answer;
+	}
+	return NULL;
 }
 
 void packDNSQuery(unsigned char *host, int qtype, unsigned char *buf, int *query_len, dns_header_t **header){
@@ -142,7 +148,6 @@ void packDNSQuery(unsigned char *host, int qtype, unsigned char *buf, int *query
 	(*header)->id = (uint16_t) htons(getpid());
 	
 	(*header)->flags = 0;
-	(*header)->flags |= QR_MASK;
 	(*header)->flags |= RD_MASK;
 	(*header)->flags = htons((*header)->flags);
 	
@@ -159,8 +164,8 @@ void packDNSQuery(unsigned char *host, int qtype, unsigned char *buf, int *query
 	*query_len += strlen(qname) + 1;
 
 	qinfo = (dns_query_info_t *) &buf[*query_len];
-	qinfo->type = qtype;
-	qinfo->class = 1; 	// for internet
+	qinfo->type = htons(qtype);
+	qinfo->class = htons(1); 	// for internet
 	*query_len += sizeof(dns_query_info_t);
 }
 
@@ -171,8 +176,8 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 	unsigned char *qname, *reader;
 	int i, j, gain;
 
-	*header = (dns_header_t *) &buf;
-	qname = (unsigned char *) &buf[sizeof(dns_header_t)];	// Point to right after the header
+	*header = (dns_header_t *) buf;
+	qname = (unsigned char *) (buf + sizeof(dns_header_t));	// Point to right after the header
 	qinfo = (dns_query_info_t *) &buf[sizeof(dns_header_t) + strlen(qname) + 1];
 
 	reader = (unsigned char *) (buf + sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t));
@@ -184,7 +189,6 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 	printf(" %d additional records\n", ntohs((*header)->arcount));
 
 	// Read answers section
-	gain = 0;
 	for (i = 0; i < ntohs((*header)->ancount); i++){
 		answer[i].name = readNameFromDNSFormat(reader, buf, &gain);
 		reader += gain;
@@ -192,11 +196,12 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 		answer[i].resource = (dns_resource_data_t *) reader;
 		reader += sizeof(dns_resource_data_t);
 
-		if (answer[i].resource->type == 1){
+		if (ntohs(answer[i].resource->type) == A_MASK || ntohs(answer[i].resource->type) == AAAA_MASK){
 			answer[i].rdata = (unsigned char*) malloc(ntohs(answer[i].resource->rdlength));
 			for (j = 0; j < ntohs(answer[i].resource->rdlength); j++){
 				answer[i].rdata[j] = reader[j];
 			}
+			answer[i].rdata[ntohs(answer[i].resource->rdlength)] = '\0';
 			reader += ntohs(answer[i].resource->rdlength);
 		}
 		else{
@@ -206,19 +211,19 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 	}
 
 	// Read Authority section
-	gain = 0;
-	for (i = 0; i < ntohs((*header)->ancount); i++){
+	for (i = 0; i < ntohs((*header)->nscount); i++){
 		auth[i].name = readNameFromDNSFormat(reader, buf, &gain);
 		reader += gain;
 
 		auth[i].resource = (dns_resource_data_t *) reader;
 		reader += sizeof(dns_resource_data_t);
 
-		if (auth[i].resource->type == 1){
+		if (ntohs(auth[i].resource->type) == A_MASK || ntohs(auth[i].resource->type) == AAAA_MASK){
 			auth[i].rdata = (unsigned char*) malloc(ntohs(auth[i].resource->rdlength));
 			for (j = 0; j < ntohs(auth[i].resource->rdlength); j++){
 				auth[i].rdata[j] = reader[j];
 			}
+			auth[i].rdata[ntohs(auth[i].resource->rdlength)] = '\0';
 			reader += ntohs(auth[i].resource->rdlength);
 		}
 		else{
@@ -228,19 +233,19 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 	}
 
 	// Read Additional records section
-	gain = 0;
-	for (i = 0; i < ntohs((*header)->ancount); i++){
+	for (i = 0; i < ntohs((*header)->arcount); i++){
 		addit[i].name = readNameFromDNSFormat(reader, buf, &gain);
 		reader += gain;
 
 		addit[i].resource = (dns_resource_data_t *) reader;
 		reader += sizeof(dns_resource_data_t);
 
-		if (addit[i].resource->type == 1){
+		if (ntohs(addit[i].resource->type) == A_MASK || ntohs(addit[i].resource->type) == AAAA_MASK){
 			addit[i].rdata = (unsigned char*) malloc(ntohs(addit[i].resource->rdlength));
 			for (j = 0; j < ntohs(addit[i].resource->rdlength); j++){
 				addit[i].rdata[j] = reader[j];
 			}
+			addit[i].rdata[ntohs(addit[i].resource->rdlength)] = '\0';
 			reader += ntohs(addit[i].resource->rdlength);
 		}
 		else{
@@ -250,8 +255,34 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 	}
 }
 
+void printRecord(dns_resource_record_t *answer){
+	int i;
+	char ipv4[INET_ADDRSTRLEN], ipv6[INET6_ADDRSTRLEN];
+	printf("%s %d %d %d %d ", answer->name, ntohs(answer->resource->type), ntohs(answer->resource->class),
+		ntohs(answer->resource->ttl), ntohs(answer->resource->rdlength));
+
+	if (ntohs(answer->resource->type) == A_MASK){
+		inet_ntop(AF_INET, answer->rdata, ipv4, INET_ADDRSTRLEN);
+		printf("%s\n", ipv4);
+	}
+	else if (ntohs(answer->resource->type) == AAAA_MASK){
+		inet_ntop(AF_INET6, answer->rdata, ipv6, INET6_ADDRSTRLEN);
+		printf("%s\n", ipv6);
+	}
+	else
+		printf("%s\n", answer->rdata);
+}
+
+void printRecords(dns_resource_record_t *answer, int count){
+	int i;
+	char ipv4[INET_ADDRSTRLEN], ipv6[INET6_ADDRSTRLEN];
+	for (i = 0; i < count; i++){
+		printRecord(&answer[i]);
+	}
+}
+
 dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest){
-	unsigned char buf[65536], *qname, *reader;
+	unsigned char buf[65536], *qname, *reader, ipv4[INET_ADDRSTRLEN];
 	dns_header_t *header;
 	dns_query_info_t *qinfo;
 
@@ -261,7 +292,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 
 	dns_resource_record_t answer[16], auth[16], addit[16], *result = NULL;
 
-	socket_desc = socket(AF_INET, SOCK_DGRAM, 0);
+	socket_desc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (socket_desc == -1){
 		printf("Socket creation failed : %s...\n", strerror(errno));
 		return NULL;
@@ -286,33 +317,41 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 
 	packDNSQuery(host, qtype, buf, &query_len, &header);
 
-	if (sendto(socket_desc, &buf, query_len, 0, (struct sockaddr *) &dest_addr, (socklen_t) dest_len) < 0)
+	if (sendto(socket_desc, (char *)buf, query_len, 0, (struct sockaddr *) &dest_addr, (socklen_t) dest_len) < 0)
 	{
 		perror("Error sending query");
 		goto resmark;
 	}
 	printf("DNS query sent\n");
 
-	if (recvfrom(socket_desc, &buf, 65536, 0, (struct sockaddr *) &dest, (socklen_t *) &dest_len) < 0){
+	if (recvfrom(socket_desc, (char *)buf, 65535, 0, (struct sockaddr *) &dest_addr, (socklen_t *) &dest_len) < 0){
 		perror("Error receiving query response");
 		goto resmark;
 	}
 	printf("DNS query response received successfully\n");
 
-	header = (dns_header_t *) &buf;
 	unpackDNSResponse(buf, answer, auth, addit, &header);
 
+	printRecords(answer, ntohs(header->ancount));
+	printRecords(auth, ntohs(header->nscount));
+	printRecords(addit, ntohs(header->arcount));
+
 	for (i = 0; i < ntohs(header->ancount); i++){
-		if (answer[i].resource->type == qtype){
+		if (ntohs(answer[i].resource->type) == qtype){
 			// We got the answer. Return this
+			result = (dns_resource_record_t *) malloc(sizeof(dns_resource_record_t));
+			
 			result->name = (unsigned char *) malloc(strlen(answer[i].name) + 1);
 			strcpy(result->name, answer[i].name);
 
 			result->resource = (dns_resource_data_t *) malloc(sizeof(dns_resource_data_t));
 			memcpy(result->resource, answer[i].resource, sizeof(dns_resource_data_t));
 
-			result->rdata = (unsigned char *) malloc(strlen(answer[i].rdata) + 1);
-			strcpy(result->rdata, answer[i].rdata);
+			result->rdata = (unsigned char *) malloc(INET_ADDRSTRLEN);
+			if (inet_ntop(AF_INET, answer[i].rdata, result->rdata, INET_ADDRSTRLEN) == NULL) {
+				perror("Address conversion failed");
+				continue;
+			}
 
 			goto resmark;
 		}
@@ -330,9 +369,14 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 
 	for (i = 0; i < ntohs(header->nscount); i++){
 		if (auth[i].rdata){
-			for (j = 0; j < ntohs(header->nscount); j++){
-				if (addit[j].resource->type == A_MASK && (addit[j].name, auth[i].rdata)){
-					result = getHostByNameAndDest(host, qtype, addit[j].rdata);
+			for (j = 0; j < ntohs(header->arcount); j++){
+				if (ntohs(addit[j].resource->type) == A_MASK && strcmp(addit[j].name, auth[i].rdata) == 0){
+					if (inet_ntop(AF_INET, addit[j].rdata, ipv4, INET_ADDRSTRLEN) == NULL) {
+						perror("Address conversion failed");
+						continue;
+					}
+
+					result = getHostByNameAndDest(host, qtype, (unsigned char *) ipv4);
 					if (result != NULL)
 						goto resmark;
 				}
@@ -383,10 +427,10 @@ unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, 
 
 	name = (unsigned char*)malloc(256);
 	name[0] = '\0';
-	*gain = 0;
+	*gain = 1;
 
 	// Get the whole name in DNS format
-	while(*reader != '\0'){
+	while(*reader != 0){
 		if (*reader >= 192){
 			// Offset is of the form 11000000 00000000
 			offset = (((*reader) & 0x3F) << 8) | (*(reader + 1)); 	// get the last 14bits;
@@ -402,13 +446,14 @@ unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, 
 		else{
 			name[ptr++] = *reader;
 		}
+		reader++ ;
 
 		if (!jump)
 			(*gain)++ ;
 	}
 	name[ptr] = '\0';
 	if (jump)
-		(*gain) += 2;
+		(*gain)++ ;
 
 	// Now convert from DNS format to original format
 	for (i = 0; i < strlen(name); i++){
