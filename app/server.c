@@ -134,22 +134,22 @@ int main() {
 	return 0;
 }
 
-void packDNSQuery(unsigned char *host, int qtype, unsigned char *buf, int *query_len, dns_header_t *header){
+void packDNSQuery(unsigned char *host, int qtype, unsigned char *buf, int *query_len, dns_header_t **header){
 	dns_query_info_t *qinfo;
 	unsigned char *qname;
 
-	header = (dns_header_t *) buf;
-	header->id = (uint16_t) htons(getpid());
+	*header = (dns_header_t *) buf;
+	(*header)->id = (uint16_t) htons(getpid());
 	
-	header->flags = 0;
-	header->flags |= QR_MASK;
-	header->flags |= RD_MASK;
-	header->flags = htons(header->flags);
+	(*header)->flags = 0;
+	(*header)->flags |= QR_MASK;
+	(*header)->flags |= RD_MASK;
+	(*header)->flags = htons((*header)->flags);
 	
-	header->qcount = htons(1);
-	header->ancount = 0;
-	header->nscount = 0;
-	header->arcount = 0;
+	(*header)->qcount = htons(1);
+	(*header)->ancount = 0;
+	(*header)->nscount = 0;
+	(*header)->arcount = 0;
 
 	*query_len += sizeof(dns_header_t);
 
@@ -165,27 +165,27 @@ void packDNSQuery(unsigned char *host, int qtype, unsigned char *buf, int *query
 }
 
 void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_resource_record_t *auth, 
-	dns_resource_record_t *addit, dns_header_t *header)
+	dns_resource_record_t *addit, dns_header_t **header)
 {
 	dns_query_info_t *qinfo;
 	unsigned char *qname, *reader;
 	int i, j, gain;
 
-	header = (dns_header_t *) &buf;
+	*header = (dns_header_t *) &buf;
 	qname = (unsigned char *) &buf[sizeof(dns_header_t)];	// Point to right after the header
 	qinfo = (dns_query_info_t *) &buf[sizeof(dns_header_t) + strlen(qname) + 1];
 
 	reader = (unsigned char *) (buf + sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t));
 
 	printf("The response is as follows....");
-	printf(" %d questions", ntohs(header->qcount));
-	printf(" %d answers", ntohs(header->ancount));
-	printf(" %d Authoritative servers", ntohs(header->nscount));
-	printf(" %d additional records\n", ntohs(header->arcount));
+	printf(" %d questions", ntohs((*header)->qcount));
+	printf(" %d answers", ntohs((*header)->ancount));
+	printf(" %d Authoritative servers", ntohs((*header)->nscount));
+	printf(" %d additional records\n", ntohs((*header)->arcount));
 
 	// Read answers section
 	gain = 0;
-	for (i = 0; i < ntohs(header->ancount); i++){
+	for (i = 0; i < ntohs((*header)->ancount); i++){
 		answer[i].name = readNameFromDNSFormat(reader, buf, &gain);
 		reader += gain;
 
@@ -207,7 +207,7 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 
 	// Read Authority section
 	gain = 0;
-	for (i = 0; i < ntohs(header->ancount); i++){
+	for (i = 0; i < ntohs((*header)->ancount); i++){
 		auth[i].name = readNameFromDNSFormat(reader, buf, &gain);
 		reader += gain;
 
@@ -229,7 +229,7 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 
 	// Read Additional records section
 	gain = 0;
-	for (i = 0; i < ntohs(header->ancount); i++){
+	for (i = 0; i < ntohs((*header)->ancount); i++){
 		addit[i].name = readNameFromDNSFormat(reader, buf, &gain);
 		reader += gain;
 
@@ -247,27 +247,6 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 			addit[i].rdata = readNameFromDNSFormat(reader, buf, &gain);
 			reader += gain;
 		}
-	}
-
-	for (i = 0; i < ntohs(header->ancount); i++){
-		if (answer[i].name)
-			free(answer[i].name);
-		if (answer[i].rdata)
-			free(answer[i].rdata);
-	}
-
-	for (i = 0; i < ntohs(header->nscount); i++){
-		if (auth[i].name)
-			free(auth[i].name);
-		if (auth[i].rdata)
-			free(auth[i].rdata);
-	}
-
-	for (i = 0; i < ntohs(header->arcount); i++){
-		if (addit[i].name)
-			free(addit[i].name);
-		if (addit[i].rdata)
-			free(addit[i].rdata);
 	}
 }
 
@@ -305,7 +284,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 
 	dest_len = sizeof(dest_addr);
 
-	packDNSQuery(host, qtype, buf, &query_len, header);
+	packDNSQuery(host, qtype, buf, &query_len, &header);
 
 	if (sendto(socket_desc, &buf, query_len, 0, (struct sockaddr *) &dest_addr, (socklen_t) dest_len) < 0)
 	{
@@ -321,13 +300,45 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 	printf("DNS query response received successfully\n");
 
 	header = (dns_header_t *) &buf;
-	unpackDNSResponse(buf, answer, auth, addit, header);
+	unpackDNSResponse(buf, answer, auth, addit, &header);
 
-	/*
-		TODO : Start a recursive query from here which searches for
-		the desired answer. If found, return the resource record.
-		Else, return NULL to signify address not found.
-	*/
+	for (i = 0; i < ntohs(header->ancount); i++){
+		if (answer[i].resource->type == qtype){
+			// We got the answer. Return this
+			result->name = (unsigned char *) malloc(strlen(answer[i].name) + 1);
+			strcpy(result->name, answer[i].name);
+
+			result->resource = (dns_resource_data_t *) malloc(sizeof(dns_resource_data_t));
+			memcpy(result->resource, answer[i].resource, sizeof(dns_resource_data_t));
+
+			result->rdata = (unsigned char *) malloc(strlen(answer[i].rdata) + 1);
+			strcpy(result->rdata, answer[i].rdata);
+
+			goto resmark;
+		}
+		else if (answer[i].resource->type = CNAME_MASK){
+			// Query this cname again to the same destination to get the required address
+			result = getHostByNameAndDest(answer[i].rdata, qtype, dest);
+			if (result != NULL)
+				goto resmark;
+		}
+		else{
+			// Not what we want
+			continue;
+		}
+	}
+
+	for (i = 0; i < ntohs(header->nscount); i++){
+		if (auth[i].rdata){
+			for (j = 0; j < ntohs(header->nscount); j++){
+				if (addit[j].resource->type == A_MASK && (addit[j].name, auth[i].rdata)){
+					result = getHostByNameAndDest(host, qtype, addit[j].rdata);
+					if (result != NULL)
+						goto resmark;
+				}
+			}
+		}
+	}
 
 resmark:
 	for (i = 0; i < ntohs(header->ancount); i++){
