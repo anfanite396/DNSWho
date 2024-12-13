@@ -18,6 +18,11 @@
 #define Z_MASK 		0x0070
 #define RCODE_MASK 	0x000F
 
+#define A_MASK 0x01
+#define NS_MASK 0x02
+#define CNAME_MASK 0x05
+#define AAAA_MASK 0x1c
+
 typedef struct{
 	uint16_t id;
 	uint16_t flags;
@@ -33,6 +38,11 @@ typedef struct{
 } dns_query_info_t;
 
 typedef struct{
+	unsigned char *qname;
+	dns_query_info_t *qinfo;
+} dns_query_t;
+
+typedef struct{
 	uint8_t type;
 	uint8_t class;
 	uint16_t ttl;
@@ -45,12 +55,14 @@ typedef struct{
 	unsigned char *rdata;
 } dns_resource_record_t;
 
-void getHostByName(unsigned char* host, int qtype);
+dns_resource_record_t* getHostByName(unsigned char* host, int qtype);
+dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest);
 void changeToDNSNameFormat(unsigned char *dns, unsigned char *host);
 void getDNSresolvers();
 unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, int *gain);
 
 unsigned char dns_resolvers[10][256];
+unsigned char root_servers[13][256];
 
 int main() {
 	// Disable output buffering
@@ -122,42 +134,11 @@ int main() {
 	return 0;
 }
 
-void getHostByName(unsigned char* host, int qtype){
-	unsigned char buf[65536], *qname, *reader;
+void packDNSQuery(unsigned char *host, int qtype, unsigned char *buf, int *query_len, dns_header_t *header){
 	dns_query_info_t *qinfo;
+	unsigned char *qname;
 
-	int socket_desc, i, j, gain, dest_len;
-	struct sockaddr_in dest;
-	struct timeval timeout;
-
-	dns_resource_record_t answer[16], auth[16], addit[16];
-
-	socket_desc = socket(AF_INET, SOCK_DGRAM, 0);
-	if (socket_desc == -1){
-		printf("Socket creation failed : %s...\n", strerror(errno));
-		return;
-	}
-
-	// Set receive timeout
-    timeout.tv_sec = 5;  // 5 second timeout
-    timeout.tv_usec = 0;
-    if (setsockopt(socket_desc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        perror("Error setting socket timeout");
-        close(socket_desc);
-        return;
-    }
-
-	dest.sin_family = AF_INET;
-	dest.sin_port = htons(53);
-    if (inet_pton(AF_INET, dns_resolvers[0], &dest.sin_addr) <= 0) {
-        printf("Invalid DNS resolver address: %s\n", dns_resolvers[0]);
-        close(socket_desc);
-        return;
-    }
-
-	dest_len = sizeof(dest);
-
-	dns_header_t *header = (dns_header_t *) &buf;
+	header = (dns_header_t *) buf;
 	header->id = (uint16_t) htons(getpid());
 	
 	header->flags = 0;
@@ -170,35 +151,31 @@ void getHostByName(unsigned char* host, int qtype){
 	header->nscount = 0;
 	header->arcount = 0;
 
-	qname = (unsigned char *) &buf[sizeof(dns_header_t)];	// Point to right after the header
-	changeToDNSNameFormat(qname, host);
+	*query_len += sizeof(dns_header_t);
 
-	qinfo = (dns_query_info_t *) &buf[sizeof(dns_header_t) + strlen(qname) + 1];
+	// qname = (unsigned char *) &buf[*query_len];	// Point to right after the header
+	qname = (unsigned char *) (buf + *query_len);
+	changeToDNSNameFormat(qname, host);
+	*query_len += strlen(qname) + 1;
+
+	qinfo = (dns_query_info_t *) &buf[*query_len];
 	qinfo->type = qtype;
 	qinfo->class = 1; 	// for internet
+	*query_len += sizeof(dns_query_info_t);
+}
 
-	int size = sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t);
-	if (sendto(socket_desc, &buf, sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t), 0,
-			(struct sockaddr *) &dest, (socklen_t) sizeof(dest)) < 0)
-	{
-		perror("Error sending query");
-		close(socket_desc);
-		return;
-	}
-	printf("DNS query sent\n");
-
-	if (recvfrom(socket_desc, &buf, 65536, 0, (struct sockaddr *) &dest, (socklen_t *) &dest_len) < 0){
-		perror("Error receiving query response");
-		close(socket_desc);
-		return;
-	}
-	printf("DNS query response received successfully\n");
+void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_resource_record_t *auth, 
+	dns_resource_record_t *addit, dns_header_t *header)
+{
+	dns_query_info_t *qinfo;
+	unsigned char *qname, *reader;
+	int i, j, gain;
 
 	header = (dns_header_t *) &buf;
-	qname = qname = (unsigned char *) &buf[sizeof(dns_header_t)];	// Point to right after the header
+	qname = (unsigned char *) &buf[sizeof(dns_header_t)];	// Point to right after the header
 	qinfo = (dns_query_info_t *) &buf[sizeof(dns_header_t) + strlen(qname) + 1];
 
-	reader = &buf[sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t)];
+	reader = (unsigned char *) (buf + sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t));
 
 	printf("The response is as follows....");
 	printf(" %d questions", ntohs(header->qcount));
@@ -292,8 +269,101 @@ void getHostByName(unsigned char* host, int qtype){
 		if (addit[i].rdata)
 			free(addit[i].rdata);
 	}
+}
+
+dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest){
+	unsigned char buf[65536], *qname, *reader;
+	dns_header_t *header;
+	dns_query_info_t *qinfo;
+
+	int socket_desc, i, j, gain, dest_len, query_len = 0;
+	struct sockaddr_in dest_addr;
+	struct timeval timeout;
+
+	dns_resource_record_t answer[16], auth[16], addit[16], *result = NULL;
+
+	socket_desc = socket(AF_INET, SOCK_DGRAM, 0);
+	if (socket_desc == -1){
+		printf("Socket creation failed : %s...\n", strerror(errno));
+		return NULL;
+	}
+
+	// Set receive timeout
+    timeout.tv_sec = 5;  // 5 second timeout
+    timeout.tv_usec = 0;
+    if (setsockopt(socket_desc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Error setting socket timeout");
+		goto resmark;
+    }
+
+	dest_addr.sin_family = AF_INET;
+	dest_addr.sin_port = htons(53);
+    if (inet_pton(AF_INET, dest, &dest_addr.sin_addr) <= 0) {
+        printf("Invalid DNS resolver address: %s\n", dns_resolvers[0]);
+		goto resmark;
+    }
+
+	dest_len = sizeof(dest_addr);
+
+	packDNSQuery(host, qtype, buf, &query_len, header);
+
+	if (sendto(socket_desc, &buf, query_len, 0, (struct sockaddr *) &dest_addr, (socklen_t) dest_len) < 0)
+	{
+		perror("Error sending query");
+		goto resmark;
+	}
+	printf("DNS query sent\n");
+
+	if (recvfrom(socket_desc, &buf, 65536, 0, (struct sockaddr *) &dest, (socklen_t *) &dest_len) < 0){
+		perror("Error receiving query response");
+		goto resmark;
+	}
+	printf("DNS query response received successfully\n");
+
+	header = (dns_header_t *) &buf;
+	unpackDNSResponse(buf, answer, auth, addit, header);
+
+	/*
+		TODO : Start a recursive query from here which searches for
+		the desired answer. If found, return the resource record.
+		Else, return NULL to signify address not found.
+	*/
+
+resmark:
+	for (i = 0; i < ntohs(header->ancount); i++){
+		if (answer[i].name)
+			free(answer[i].name);
+		if (answer[i].rdata)
+			free(answer[i].rdata);
+	}
+
+	for (i = 0; i < ntohs(header->nscount); i++){
+		if (auth[i].name)
+			free(auth[i].name);
+		if (auth[i].rdata)
+			free(auth[i].rdata);
+	}
+
+	for (i = 0; i < ntohs(header->arcount); i++){
+		if (addit[i].name)
+			free(addit[i].name);
+		if (addit[i].rdata)
+			free(addit[i].rdata);
+	}
 
 	close(socket_desc);
+	return result;
+}
+
+dns_resource_record_t* getHostByName(unsigned char* host, int qtype){
+	int i;
+	dns_resource_record_t *answer;
+	for (i = 0; i < 13; i++){
+		answer = getHostByNameAndDest(host, qtype, root_servers[i]);
+		if (answer != NULL)
+			return answer;
+	}
+	return NULL;
 }
 
 unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, int *gain){
@@ -346,6 +416,20 @@ unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, 
 void getDNSresolvers(){
 	strcpy(dns_resolvers[0], "1.1.1.1");
 	strcpy(dns_resolvers[1], "8.8.8.8");
+
+	strcpy(root_servers[0], "198.41.0.4");
+	strcpy(root_servers[1], "170.247.170.2");
+	strcpy(root_servers[2], "192.33.4.12");
+	strcpy(root_servers[3], "199.7.91.13");
+	strcpy(root_servers[4], "192.203.230.10");
+	strcpy(root_servers[5], "192.5.5.241");
+	strcpy(root_servers[6], "192.112.36.4");
+	strcpy(root_servers[7], "198.97.190.53");
+	strcpy(root_servers[8], "192.36.148.17");
+	strcpy(root_servers[9], "192.58.128.30");
+	strcpy(root_servers[10], "193.0.14.129");
+	strcpy(root_servers[11], "199.7.83.42");
+	strcpy(root_servers[12], "202.12.27.33");
 }
 
 void changeToDNSNameFormat(unsigned char* dns, unsigned char* host){
