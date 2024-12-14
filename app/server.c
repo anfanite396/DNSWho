@@ -26,7 +26,7 @@ int main() {
 	getDNSresolvers();
 
 	// unsigned char host[256];
-	// strcpy((char *)host, "academy.networkchuck.com");
+	// strcpy((char *)host, "codecrafters.io");
 	// int qtype = 1;
 	// dns_resource_record_t *dns = getHostByName(host, qtype);
 	// if (dns != NULL)
@@ -56,8 +56,8 @@ int main() {
 		return 1;
 	}
 
-	int bytesRead;
-	unsigned char buf[65536], *qname;
+	int bytesRead, gain = 0;
+	unsigned char buf[65536], host[256], *qname, *reader;
 	dns_query_info_t *qinfo;
 	struct sockaddr_in clientAddress;
 	socklen_t clientAddrLen = sizeof(clientAddress);
@@ -73,12 +73,13 @@ int main() {
 		printf("Received %d bytes : %s\n", bytesRead, buf);
 
 		dns_header_t *header = (dns_header_t *) &buf;
-		qname = (unsigned char *) &buf[sizeof(header)];
-		qinfo = (dns_query_info_t *) &buf[sizeof(header) + strlen(qname) + 1];
+		qname = (unsigned char *) &buf[sizeof(dns_header_t)];
+		qinfo = (dns_query_info_t *) &buf[sizeof(dns_header_t) + strlen(qname) + 1];
+		int size = sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t);
 
-		int size = sizeof(header) + strlen(qname) + 1 + sizeof(dns_query_info_t);
+		reader = readNameFromDNSFormat(qname, buf, &gain);
 
-		dns_resource_record_t *result = getHostByName(qname, ntohs(qinfo->type));
+		dns_resource_record_t *result = getHostByName(reader, ntohs(qinfo->type));
 
 		if (result == NULL){
 			// Hum pe to hai hi na, ask someone else
@@ -92,6 +93,11 @@ int main() {
 			header->flags |= QR_MASK;
 			header->flags |= RA_MASK;
 			header->flags = htons(header->flags);
+
+			header->qcount = 0;
+			header->ancount = 0;
+			header->nscount = 0;
+			header->arcount = 0;
 		}
 		else{
 			header->flags = 0;
@@ -104,14 +110,16 @@ int main() {
 			header->nscount = 0;
 			header->arcount = 0;
 
-			dns_resource_record_t *answer = (dns_resource_record_t *) &buf[size];
-			strcpy(answer->name, qname);
+			reader = (unsigned char *) &buf[size];
+			memcpy(reader, qname, strlen(qname) + 1);
 			size += strlen(qname) + 1;
 
-			memcpy(answer->resource, result->resource, sizeof(dns_resource_data_t));
+			reader += strlen(qname) + 1;
+			memcpy(reader, result->resource, sizeof(dns_resource_data_t));
 			size += sizeof(dns_resource_data_t);
 
-			memcpy(answer->name, result->rdata, INET_ADDRSTRLEN);	// Copy the whole encoded address
+			reader += sizeof(dns_resource_data_t);
+			inet_pton(AF_INET, result->rdata, reader);
 			size += INET_ADDRSTRLEN;
 		}
 
@@ -290,7 +298,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 	struct sockaddr_in dest_addr;
 	struct timeval timeout;
 
-	dns_resource_record_t answer[16], auth[16], addit[16], *result = NULL;
+	dns_resource_record_t answer[20], auth[20], addit[20], *result = NULL;
 
 	socket_desc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (socket_desc == -1){
@@ -309,7 +317,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 	dest_addr.sin_family = AF_INET;
 	dest_addr.sin_port = htons(53);
     if (inet_pton(AF_INET, dest, &dest_addr.sin_addr) <= 0) {
-        printf("Invalid DNS resolver address: %s\n", dns_resolvers[0]);
+        printf("Invalid DNS resolver address: %s\n", dest);
 		goto resmark;
     }
 
@@ -369,6 +377,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 
 	for (i = 0; i < ntohs(header->nscount); i++){
 		if (auth[i].rdata){
+			int gotIP = 0;
 			for (j = 0; j < ntohs(header->arcount); j++){
 				if (ntohs(addit[j].resource->type) == A_MASK && strcmp(addit[j].name, auth[i].rdata) == 0){
 					if (inet_ntop(AF_INET, addit[j].rdata, ipv4, INET_ADDRSTRLEN) == NULL) {
@@ -377,6 +386,15 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 					}
 
 					result = getHostByNameAndDest(host, qtype, (unsigned char *) ipv4);
+					if (result != NULL)
+						goto resmark;
+				}
+			}
+
+			if (!gotIP){
+				dns_resource_record_t *record = getHostByName(auth[i].rdata, 1);
+				if (record != NULL){
+					result = getHostByNameAndDest(host, qtype, record->rdata);
 					if (result != NULL)
 						goto resmark;
 				}
