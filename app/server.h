@@ -15,6 +15,10 @@
 #define CNAME_MASK 	0x05
 #define AAAA_MASK 	0x1c
 
+#define BUF_SIZE 8192
+#define QUEUE_SIZE 4
+#define THREAD_POOL_SIZE 20
+
 typedef struct{
 	uint16_t id;
 	uint16_t flags;
@@ -47,6 +51,23 @@ typedef struct{
 	unsigned char *rdata;
 } dns_resource_record_t;
 
+typedef struct {
+	int client_id;
+	int socket_desc;
+	unsigned char buf[BUF_SIZE];
+	struct sockaddr_in client_addr;
+	int client_addr_len;
+	int bytes_read;
+} client_request_t;
+
+typedef struct {
+	client_request_t *requests[QUEUE_SIZE];
+	int head, tail, size;
+	pthread_mutex_t mutex;
+	pthread_cond_t isNotFull;
+	pthread_cond_t isNotEmpty;
+} task_queue_t;
+
 dns_resource_record_t* getHostByName(unsigned char* host, int qtype);
 
 dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest);
@@ -67,3 +88,11 @@ void printRecords(dns_resource_record_t *answer, int count);
 void printRecord(dns_resource_record_t *answer);
 
 dns_resource_record_t* getHostFromResolver(unsigned char *host, int qtype);
+
+void init_queue(task_queue_t *tasks);
+
+void enqueue_task(task_queue_t *tasks, client_request_t *client);
+
+client_request_t* dequeue_task(task_queue_t *tasks);
+
+void *worker_thread(void *arg);

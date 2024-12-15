@@ -8,11 +8,16 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #include "server.h"
 
+#define PORT 2053
+
 unsigned char dns_resolvers[10][256];
 unsigned char root_servers[13][256];
+
+task_queue_t tasks;
 
 int main() {
 	// Disable output buffering
@@ -24,6 +29,9 @@ int main() {
 
 	// Get the names of standard DNS resolvers and Root name servers
 	getDNSresolvers();
+
+	// Initialize task queue
+	init_queue(&tasks);
 
 	// unsigned char host[256];
 	// strcpy((char *)host, "codecrafters.io");
@@ -47,7 +55,7 @@ int main() {
 
 	struct sockaddr_in serv_addr;
 	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(2053);
+	serv_addr.sin_port = htons(PORT);
 	serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
 	// Bind the socket to the address
@@ -56,28 +64,85 @@ int main() {
 		return 1;
 	}
 
-	int bytesRead, gain = 0;
-	unsigned char buf[65536], host[256], *qname, *reader;
-	dns_query_info_t *qinfo;
-	struct sockaddr_in clientAddress;
-	socklen_t clientAddrLen = sizeof(clientAddress);
+	// Initiate the threads
+	pthread_t thread_pool[THREAD_POOL_SIZE];
+	for (int i = 0; i < THREAD_POOL_SIZE; i++){
+		pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
+	}
 
 	while(1){
-		bytesRead = recvfrom(socket_desc, buf, 65536, 0, (struct sockaddr *) &clientAddress, &clientAddrLen);
-		if (bytesRead == -1){
+		client_request_t *client = malloc(sizeof(client_request_t));
+		if (client == NULL){
+			perror("Failed to allocate memory");
+			continue;
+		}
+		client->socket_desc = socket_desc;
+		client->client_addr_len = sizeof(client->client_addr);
+		client->bytes_read = recvfrom(socket_desc, client->buf, BUF_SIZE, 0, (struct sockaddr *) &(client->client_addr),
+				&(client->client_addr_len));
+		if (client->bytes_read == -1){
 			perror("Error receiving data");
 			break;
 		}
 
-		buf[bytesRead] = '\0';
-		printf("Received %d bytes : %s\n", bytesRead, buf);
+		enqueue_task(&tasks, client);
+	}
 
-		dns_header_t *header = (dns_header_t *) &buf;
-		qname = (unsigned char *) &buf[sizeof(dns_header_t)];
-		qinfo = (dns_query_info_t *) &buf[sizeof(dns_header_t) + strlen(qname) + 1];
+	close(socket_desc);
+	return 0;
+}
+
+void init_queue(task_queue_t *tasks){
+	tasks->head = tasks->tail = tasks->size = 0;
+	pthread_mutex_init(&tasks->mutex, NULL);
+	pthread_cond_init(&tasks->isNotFull, NULL);
+	pthread_cond_init(&tasks->isNotEmpty, NULL);
+}
+
+void enqueue_task(task_queue_t *tasks, client_request_t *client){
+	pthread_mutex_lock(&tasks->mutex);
+	while(tasks->size == QUEUE_SIZE){
+		pthread_cond_wait(&tasks->isNotFull, &tasks->mutex);
+	}
+	tasks->requests[tasks->tail] = client;
+	tasks->tail = (tasks->tail + 1) % QUEUE_SIZE;
+	tasks->size++ ;
+	pthread_cond_signal(&tasks->isNotEmpty);
+	pthread_mutex_unlock(&tasks->mutex);
+}
+
+client_request_t* dequeue_task(task_queue_t *tasks){
+	pthread_mutex_lock(&tasks->mutex);
+	while(tasks->size == 0){
+		pthread_cond_wait(&tasks->isNotEmpty, &tasks->mutex);
+	}
+	client_request_t *client = tasks->requests[tasks->head];
+	client->client_id = tasks->head;
+	tasks->head = (tasks->head + 1) % QUEUE_SIZE;
+	tasks->size-- ;
+	pthread_cond_signal(&tasks->isNotFull);
+	pthread_mutex_unlock(&tasks->mutex);
+	return client;
+}
+
+void *worker_thread(void *arg){
+	unsigned char *qname, *reader;
+	dns_query_info_t *qinfo;
+	int gain = 0;
+
+	while(1){
+		client_request_t *client = dequeue_task(&tasks);
+		printf("Handling request from %s::%d\n", inet_ntoa(client->client_addr.sin_addr), ntohs(client->client_addr.sin_port));
+
+		client->buf[client->bytes_read] = '\0';
+		printf("Received %d bytes at thread %d\n", client->bytes_read, client->client_id);
+
+		dns_header_t *header = (dns_header_t *) &client->buf;
+		qname = (unsigned char *) &client->buf[sizeof(dns_header_t)];
+		qinfo = (dns_query_info_t *) &client->buf[sizeof(dns_header_t) + strlen(qname) + 1];
 		int size = sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t);
 
-		reader = readNameFromDNSFormat(qname, buf, &gain);
+		reader = readNameFromDNSFormat(qname, client->buf, &gain);
 
 		dns_resource_record_t *result = getHostByName(reader, ntohs(qinfo->type));
 
@@ -110,7 +175,7 @@ int main() {
 			header->nscount = 0;
 			header->arcount = 0;
 
-			reader = (unsigned char *) &buf[size];
+			reader = (unsigned char *) &client->buf[size];
 			memcpy(reader, qname, strlen(qname) + 1);
 			size += strlen(qname) + 1;
 
@@ -124,17 +189,17 @@ int main() {
 		}
 
 		// Send the response back
-		if (sendto(socket_desc, &buf, size, 0, (struct sockaddr *) & clientAddress, clientAddrLen) == -1){
+		if (sendto(client->socket_desc, &client->buf, size, 0, (struct sockaddr *) & client->client_addr, client->client_addr_len) == -1){
 			perror("Error sending response");
 		}
-
-		printf("Query response sent successfully");
+		else{
+			printf("Query response sent successfully\n");
+		}
 
 		free(result);
+		free(client);
 	}
-
-	close(socket_desc);
-	return 0;
+	return NULL;
 }
 
 dns_resource_record_t* getHostFromResolver(unsigned char *host, int qtype){
@@ -190,11 +255,11 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 
 	reader = (unsigned char *) (buf + sizeof(dns_header_t) + strlen(qname) + 1 + sizeof(dns_query_info_t));
 
-	printf("The response is as follows....");
-	printf(" %d questions", ntohs((*header)->qcount));
-	printf(" %d answers", ntohs((*header)->ancount));
-	printf(" %d Authoritative servers", ntohs((*header)->nscount));
-	printf(" %d additional records\n", ntohs((*header)->arcount));
+	// printf("The response is as follows....");
+	// printf(" %d questions", ntohs((*header)->qcount));
+	// printf(" %d answers", ntohs((*header)->ancount));
+	// printf(" %d Authoritative servers", ntohs((*header)->nscount));
+	// printf(" %d additional records\n", ntohs((*header)->arcount));
 
 	// Read answers section
 	for (i = 0; i < ntohs((*header)->ancount); i++){
@@ -290,7 +355,7 @@ void printRecords(dns_resource_record_t *answer, int count){
 }
 
 dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest){
-	unsigned char buf[65536], *qname, *reader, ipv4[INET_ADDRSTRLEN];
+	unsigned char buf[BUF_SIZE], *qname, *reader, ipv4[INET_ADDRSTRLEN];
 	dns_header_t *header;
 	dns_query_info_t *qinfo;
 
@@ -330,19 +395,19 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 		perror("Error sending query");
 		goto resmark;
 	}
-	printf("DNS query sent\n");
+	// printf("DNS query sent\n");
 
 	if (recvfrom(socket_desc, (char *)buf, 65535, 0, (struct sockaddr *) &dest_addr, (socklen_t *) &dest_len) < 0){
 		perror("Error receiving query response");
 		goto resmark;
 	}
-	printf("DNS query response received successfully\n");
+	// printf("DNS query response received successfully\n");
 
 	unpackDNSResponse(buf, answer, auth, addit, &header);
 
-	printRecords(answer, ntohs(header->ancount));
-	printRecords(auth, ntohs(header->nscount));
-	printRecords(addit, ntohs(header->arcount));
+	// printRecords(answer, ntohs(header->ancount));
+	// printRecords(auth, ntohs(header->nscount));
+	// printRecords(addit, ntohs(header->arcount));
 
 	for (i = 0; i < ntohs(header->ancount); i++){
 		if (ntohs(answer[i].resource->type) == qtype){
@@ -404,24 +469,18 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 
 resmark:
 	for (i = 0; i < ntohs(header->ancount); i++){
-		if (answer[i].name)
-			free(answer[i].name);
-		if (answer[i].rdata)
-			free(answer[i].rdata);
+		free(answer[i].name);
+		free(answer[i].rdata);
 	}
 
 	for (i = 0; i < ntohs(header->nscount); i++){
-		if (auth[i].name)
-			free(auth[i].name);
-		if (auth[i].rdata)
-			free(auth[i].rdata);
+		free(auth[i].name);
+		free(auth[i].rdata);
 	}
 
 	for (i = 0; i < ntohs(header->arcount); i++){
-		if (addit[i].name)
-			free(addit[i].name);
-		if (addit[i].rdata)
-			free(addit[i].rdata);
+		free(addit[i].name);
+		free(addit[i].rdata);
 	}
 
 	close(socket_desc);

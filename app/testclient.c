@@ -10,6 +10,8 @@
 
 #include "server.h"
 
+#define PORT 2053
+
 int main(){
     int sock_desc = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_desc < 0){
@@ -24,7 +26,7 @@ int main(){
     int qtype = 1;
 
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(2053);
+    serv_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0){
         perror("Invalid server IP");
         close(sock_desc);
@@ -70,7 +72,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 	}
 
 	// Set receive timeout
-    timeout.tv_sec = 5;  // 5 second timeout
+    timeout.tv_sec = 15;  // 5 second timeout
     timeout.tv_usec = 0;
     if (setsockopt(socket_desc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
         perror("Error setting socket timeout");
@@ -78,7 +80,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
     }
 
 	dest_addr.sin_family = AF_INET;
-	dest_addr.sin_port = htons(2053);
+	dest_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, dest, &dest_addr.sin_addr) <= 0) {
         printf("Invalid DNS resolver address: %s\n", dest);
 		goto resmark;
