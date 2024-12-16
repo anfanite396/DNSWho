@@ -9,10 +9,20 @@
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "server.h"
 
-#define PORT 2053
+#define UNENCRYPT_PORT 2053
+#define ENCRYPT_PORT 853
+
+void handleUDPConnection(int udp_socket, client_request_t *client);
+void handleTCPConnection(int tcp_socket, client_request_t *client);
+void handleTLSConnection(int tls_socket, client_request_t *client, SSL_CTX *ctx);
+void init_openssl();
+void cleanup_openssl();
+SSL_CTX* createAndConfigureContext();
 
 unsigned char dns_resolvers[10][256];
 unsigned char root_servers[13][256];
@@ -33,6 +43,13 @@ int main() {
 	// Initialize task queue
 	init_queue(&tasks);
 
+	// Init variables
+	int udp_socket, tcp_socket, tls_socket, max_fd = 0, reuse = 1;
+	struct sockaddr_in serv_addr_unenc, serv_addr_enc;
+	pthread_t thread_pool[THREAD_POOL_SIZE];
+	fd_set read_fd;
+	SSL_CTX *ctx;
+
 	// unsigned char host[256];
 	// strcpy((char *)host, "codecrafters.io");
 	// int qtype = 1;
@@ -41,55 +58,225 @@ int main() {
 	// 	printf("The IP address of %s is : %s\n", host, dns->rdata);
 
 	// Creating a UDP socket
-	int socket_desc = socket(AF_INET, SOCK_DGRAM, 0);
-	if (socket_desc == -1){
+	udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+	if (udp_socket == -1){
 		printf("Socket creation failed : %s...\n", strerror(errno));
 		return 1;
 	}
 
-	int reuse = 1;
-	if (setsockopt(socket_desc, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0){
+	if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0){
 		printf("SO_REUSEPORT failed: %s...\n", strerror(errno));
 		return 1;
 	}
 
-	struct sockaddr_in serv_addr;
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(PORT);
-	serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-	// Bind the socket to the address
-	if (bind(socket_desc, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) != 0){
-		printf("Bind failed : %s...\n", strerror(errno));
+	// Creating a TCP socket
+	tcp_socket = socket(AF_INET, SOCK_STREAM, 0);
+	if (tcp_socket == -1){
+		printf("Socket creation failed : %s...\n", strerror(errno));
 		return 1;
 	}
 
+	if (setsockopt(tcp_socket, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0){
+		perror("SO_REUSEPORT failed for TCP socket");
+		return 1;
+	}
+
+	// Creating a TCP socket for accepting TLS connections
+	tls_socket = socket(AF_INET, SOCK_STREAM, 0);
+	if (tls_socket == -1){
+		printf("Socket creation failed : %s...\n", strerror(errno));
+		return 1;
+	}
+
+	if (setsockopt(tls_socket, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0){
+		perror("SO_REUSEPORT failed for TCP socket");
+		return 1;
+	}
+
+	// Setting up the encrypted and unencrpyted servers
+	serv_addr_unenc.sin_family = AF_INET;
+	serv_addr_unenc.sin_port = htons(UNENCRYPT_PORT);
+	serv_addr_unenc.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	serv_addr_enc.sin_family = AF_INET;
+	serv_addr_enc.sin_port = htons(ENCRYPT_PORT);
+	serv_addr_enc.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	// Bind the TCP and UDP socket to the address
+	if (bind(udp_socket, (struct sockaddr *) &serv_addr_unenc, (socklen_t) sizeof(serv_addr_unenc)) != 0){
+		perror("Bind failed with udp socket");
+		return 1;
+	}
+
+	if (bind(tcp_socket, (struct sockaddr *) &serv_addr_unenc, (socklen_t) sizeof(serv_addr_unenc)) != 0){
+		perror("Bind failed with tcp socket");
+		return 1;
+	}
+
+	if (bind(tls_socket, (struct sockaddr *) &serv_addr_enc, (socklen_t) sizeof(serv_addr_enc)) != 0){
+		perror("Bind failed with tls socket");
+		return 1;
+	}
+
+	if (listen(tcp_socket, 4) < 0){
+		perror("Failed to listen on TCP socket");
+		exit(EXIT_FAILURE);
+	}
+	listen(tls_socket, 1);
+
 	// Initiate the threads
-	pthread_t thread_pool[THREAD_POOL_SIZE];
 	for (int i = 0; i < THREAD_POOL_SIZE; i++){
 		pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
 	}
 
+	// Set the max fd
+	max_fd = (udp_socket > tcp_socket) ? udp_socket : tcp_socket;
+	max_fd = (max_fd > tls_socket) ? max_fd : tls_socket;
+
+	// Initialize OpenSSL
+	init_openssl();
+	ctx = createAndConfigureContext();
+
 	while(1){
+		FD_ZERO(&read_fd);
+		FD_SET(udp_socket, &read_fd);
+		FD_SET(tcp_socket, &read_fd);
+		FD_SET(tls_socket, &read_fd);
+
 		client_request_t *client = malloc(sizeof(client_request_t));
 		if (client == NULL){
 			perror("Failed to allocate memory");
 			continue;
 		}
-		client->socket_desc = socket_desc;
-		client->client_addr_len = sizeof(client->client_addr);
-		client->bytes_read = recvfrom(socket_desc, client->buf, BUF_SIZE, 0, (struct sockaddr *) &(client->client_addr),
-				&(client->client_addr_len));
-		if (client->bytes_read == -1){
-			perror("Error receiving data");
-			break;
+
+		if (select(max_fd + 1, &read_fd, NULL, NULL, NULL) < 0){
+			perror("Select error");
+			exit(EXIT_FAILURE);
 		}
 
-		enqueue_task(&tasks, client);
+		if (FD_ISSET(udp_socket, &read_fd)){
+			handleUDPConnection(udp_socket, client);
+		}
+
+		if (FD_ISSET(tcp_socket, &read_fd)){
+			handleTCPConnection(tcp_socket, client);
+		}
+
+		if (FD_ISSET(tls_socket, &read_fd)){
+			handleTLSConnection(tls_socket, client, ctx);
+		}
 	}
 
-	close(socket_desc);
+	close(udp_socket);
+	close(tcp_socket);
+	close(tls_socket);
+	SSL_CTX_free(ctx);
+	cleanup_openssl();
 	return 0;
+}
+
+void init_openssl() {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+void cleanup_openssl() {
+    EVP_cleanup();
+}
+
+void handleUDPConnection(int udp_socket, client_request_t *client){
+	client->socket_desc = udp_socket;
+	client->conn_type = 1;
+	client->client_addr_len = sizeof(client->client_addr);
+	client->bytes_read = recvfrom(udp_socket, client->buf, BUF_SIZE, 0, (struct sockaddr *) &(client->client_addr),
+			(socklen_t *) &(client->client_addr_len));
+	if (client->bytes_read == -1){
+		perror("Error receiving data");
+		return;
+	}
+
+	enqueue_task(&tasks, client);
+}
+
+void handleTCPConnection(int tcp_socket, client_request_t *client){
+	int conn;
+
+	client->conn_type = 2;
+	client->client_addr_len = sizeof(client->client_addr);
+
+	conn = accept(tcp_socket, (struct sockaddr *) &client->client_addr, (socklen_t *) &client->client_addr_len);
+	if (conn < 0){
+		printf("Unable to accept connection on port %d\n", UNENCRYPT_PORT);
+		return;
+	}
+	printf("TCP connection established\n");
+
+	client->socket_desc = conn;
+	client->bytes_read = recv(conn, &client->buf, BUF_SIZE, 0);
+	if (client->bytes_read <= 0){
+		perror("Error receiving TCP data");
+		close(conn);
+		return;
+	}
+
+	enqueue_task(&tasks, client);
+}
+
+void handleTLSConnection(int tls_socket, client_request_t *client, SSL_CTX *ctx){
+	int conn;
+
+	client->conn_type = 3;
+	client->client_addr_len = sizeof(client->client_addr);
+
+	conn = accept(tls_socket, (struct sockaddr *) &client->client_addr, (socklen_t *) &client->client_addr_len);
+	if (conn < 0){
+		printf("Unable to accept connections on port %d\n", ENCRYPT_PORT);
+		return;
+	}
+	printf("TLS connection established\n");
+
+	client->socket_desc = conn;
+	client->ssl = SSL_new(ctx);
+	SSL_set_fd(client->ssl, conn);
+
+	if (SSL_accept(client->ssl) <= 0){
+		ERR_print_errors_fp(stderr);
+        close(conn);
+        SSL_free(client->ssl);
+        return;
+	}
+
+	client->bytes_read = SSL_read(client->ssl, &client->buf, BUF_SIZE);
+	if (client->bytes_read <= 0){
+		perror("Error reading TLS data");
+	}
+
+	enqueue_task(&tasks, client);
+}
+
+SSL_CTX* createAndConfigureContext(){
+	const SSL_METHOD *method;
+	SSL_CTX *ctx;
+
+	method = TLS_server_method();
+	ctx = SSL_CTX_new(method);
+	if (!ctx){
+		perror("Unable to create SSL context");
+		ERR_print_errors_fp(stderr);
+		exit(EXIT_FAILURE);
+	}
+
+	// Set the key and cert
+	if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0){
+		ERR_print_errors_fp(stderr);
+		exit(EXIT_FAILURE);
+	}
+
+	if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0){
+		ERR_print_errors_fp(stderr);
+		exit(EXIT_FAILURE);
+	}
+	return ctx;
 }
 
 void init_queue(task_queue_t *tasks){
@@ -149,6 +336,7 @@ void *worker_thread(void *arg){
 		if (result == NULL){
 			// Hum pe to hai hi na, ask someone else
 			result = getHostFromResolver(qname, ntohs(qinfo->type));
+			printf("Resorted to standard DNS resolvers\n");
 		}
 
 		if (result == NULL){
@@ -189,11 +377,34 @@ void *worker_thread(void *arg){
 		}
 
 		// Send the response back
-		if (sendto(client->socket_desc, &client->buf, size, 0, (struct sockaddr *) & client->client_addr, client->client_addr_len) == -1){
-			perror("Error sending response");
+		if (client->conn_type == 1){
+			if (sendto(client->socket_desc, &client->buf, size, 0, (struct sockaddr *) & client->client_addr, client->client_addr_len) == -1){
+				perror("Error sending response");
+			}
+			else{
+				printf("Query response sent successfully\n");
+			}
 		}
-		else{
-			printf("Query response sent successfully\n");
+		else if (client->conn_type == 2){
+			if (send(client->socket_desc, &client->buf, size, 0) < 0){
+				perror("Error sending response");
+			}
+			else{
+				printf("Query response sent successfully\n");
+			}
+			shutdown(client->socket_desc, SHUT_RDWR);
+			close(client->socket_desc);
+		}
+		else if (client->conn_type == 3){
+			if (SSL_write(client->ssl, &client->buf, size) <= 0){
+				perror("Error sending response");
+			}
+			else{
+				printf("Query response sent successfully\n");
+			}
+			SSL_shutdown(client->ssl);
+			SSL_free(client->ssl);
+			close(client->socket_desc);
 		}
 
 		free(result);
@@ -299,9 +510,14 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 			auth[i].rdata[ntohs(auth[i].resource->rdlength)] = '\0';
 			reader += ntohs(auth[i].resource->rdlength);
 		}
-		else{
+		else if (ntohs(auth[i].resource->type) == NS_MASK){
 			auth[i].rdata = readNameFromDNSFormat(reader, buf, &gain);
 			reader += gain;
+		}
+		else{
+			// Ignore
+			reader += ntohs(auth[i].resource->rdlength);
+			auth[i].rdata = NULL;
 		}
 	}
 
@@ -329,7 +545,6 @@ void unpackDNSResponse(unsigned char *buf, dns_resource_record_t *answer, dns_re
 }
 
 void printRecord(dns_resource_record_t *answer){
-	int i;
 	char ipv4[INET_ADDRSTRLEN], ipv6[INET6_ADDRSTRLEN];
 	printf("%s %d %d %d %d ", answer->name, ntohs(answer->resource->type), ntohs(answer->resource->class),
 		ntohs(answer->resource->ttl), ntohs(answer->resource->rdlength));
@@ -342,24 +557,28 @@ void printRecord(dns_resource_record_t *answer){
 		inet_ntop(AF_INET6, answer->rdata, ipv6, INET6_ADDRSTRLEN);
 		printf("%s\n", ipv6);
 	}
-	else
+	else if (ntohs(answer->resource->type) == NS_MASK){
 		printf("%s\n", answer->rdata);
+	}
+	else{
+		// Ignore
+		printf("Ignored\n");
+	}
 }
 
 void printRecords(dns_resource_record_t *answer, int count){
 	int i;
-	char ipv4[INET_ADDRSTRLEN], ipv6[INET6_ADDRSTRLEN];
 	for (i = 0; i < count; i++){
 		printRecord(&answer[i]);
 	}
 }
 
 dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest){
-	unsigned char buf[BUF_SIZE], *qname, *reader, ipv4[INET_ADDRSTRLEN];
+	// printf("Querying %s for %s\n", dest, host);
+	unsigned char buf[BUF_SIZE], ipv4[INET_ADDRSTRLEN];
 	dns_header_t *header;
-	dns_query_info_t *qinfo;
 
-	int socket_desc, i, j, gain, dest_len, query_len = 0;
+	int socket_desc, i, j, dest_len, query_len = 0;
 	struct sockaddr_in dest_addr;
 	struct timeval timeout;
 
@@ -428,7 +647,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 
 			goto resmark;
 		}
-		else if (answer[i].resource->type = CNAME_MASK){
+		else if (ntohs(answer[i].resource->type) == CNAME_MASK){
 			// Query this cname again to the same destination to get the required address
 			result = getHostByNameAndDest(answer[i].rdata, qtype, dest);
 			if (result != NULL)
@@ -445,7 +664,7 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
 			int gotIP = 0;
 			for (j = 0; j < ntohs(header->arcount); j++){
 				if (ntohs(addit[j].resource->type) == A_MASK && strcmp(addit[j].name, auth[i].rdata) == 0){
-					if (inet_ntop(AF_INET, addit[j].rdata, ipv4, INET_ADDRSTRLEN) == NULL) {
+					if (inet_ntop(AF_INET, addit[j].rdata, (char *) ipv4, INET_ADDRSTRLEN) == NULL) {
 						perror("Address conversion failed");
 						continue;
 					}
@@ -533,13 +752,13 @@ unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, 
 		(*gain)++ ;
 
 	// Now convert from DNS format to original format
-	for (i = 0; i < strlen(name); i++){
+	for (i = 0; i < (int)strlen((char *) name);){
 		ptr = name[i];
 		for (j = i; j < i + ptr; j++){
 			name[j] = name[j + 1];
 		}
 		name[i + ptr] = '.';
-		i += ptr;
+		i += ptr + 1;
 	}
 	name[i - 1] = '\0';		// Remove the last '.'
 
@@ -547,36 +766,37 @@ unsigned char* readNameFromDNSFormat(unsigned char *reader, unsigned char *buf, 
 }
 
 void getDNSresolvers(){
-	strcpy(dns_resolvers[0], "1.1.1.1");
-	strcpy(dns_resolvers[1], "8.8.8.8");
+	strcpy((char *) dns_resolvers[0], "1.1.1.1");
+	strcpy((char *) dns_resolvers[1], "8.8.8.8");
 
-	strcpy(root_servers[0], "198.41.0.4");
-	strcpy(root_servers[1], "170.247.170.2");
-	strcpy(root_servers[2], "192.33.4.12");
-	strcpy(root_servers[3], "199.7.91.13");
-	strcpy(root_servers[4], "192.203.230.10");
-	strcpy(root_servers[5], "192.5.5.241");
-	strcpy(root_servers[6], "192.112.36.4");
-	strcpy(root_servers[7], "198.97.190.53");
-	strcpy(root_servers[8], "192.36.148.17");
-	strcpy(root_servers[9], "192.58.128.30");
-	strcpy(root_servers[10], "193.0.14.129");
-	strcpy(root_servers[11], "199.7.83.42");
-	strcpy(root_servers[12], "202.12.27.33");
+	strcpy((char *) root_servers[0], "198.41.0.4");
+	strcpy((char *) root_servers[1], "170.247.170.2");
+	strcpy((char *) root_servers[2], "192.33.4.12");
+	strcpy((char *) root_servers[3], "199.7.91.13");
+	strcpy((char *) root_servers[4], "192.203.230.10");
+	strcpy((char *) root_servers[5], "192.5.5.241");
+	strcpy((char *) root_servers[6], "192.112.36.4");
+	strcpy((char *) root_servers[7], "198.97.190.53");
+	strcpy((char *) root_servers[8], "192.36.148.17");
+	strcpy((char *) root_servers[9], "192.58.128.30");
+	strcpy((char *) root_servers[10], "193.0.14.129");
+	strcpy((char *) root_servers[11], "199.7.83.42");
+	strcpy((char *) root_servers[12], "202.12.27.33");
 }
 
 void changeToDNSNameFormat(unsigned char* dns, unsigned char* host){
 	int i = 0, j = 0;
 	strcat((char*)host, ".");
 
-	for (i = 0; i < strlen((char*)host); i++){
+	for (i = 0; i < (int)strlen((char*)host); i++){
 		if (host[i] == '.'){
 			*dns++ = i - j;
-			for (j; j < i; j++){
+			for (; j < i; j++){
 				*dns++ = host[j];
 			}
 			j++ ;
 		}
 	}
+	host[strlen((char*)host) - 1] = '\0';
 	*dns++ = '\0';
 }

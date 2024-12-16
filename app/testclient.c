@@ -7,13 +7,38 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <string.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "server.h"
 
 #define PORT 2053
 
+void init_openssl() {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+void cleanup_openssl() {
+    EVP_cleanup();
+}
+
+SSL_CTX *create_context() {
+    const SSL_METHOD *method;
+    SSL_CTX *ctx;
+
+    method = TLS_client_method();
+    ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
 int main(){
-    int sock_desc = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock_desc = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_desc < 0){
         perror("Socket creation failed");
         return 1;
@@ -25,8 +50,10 @@ int main(){
     dns_resource_record_t *dns;
     int qtype = 1;
 
+	init_openssl();
+
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
+    serv_addr.sin_port = htons(853);
     if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0){
         perror("Invalid server IP");
         close(sock_desc);
@@ -37,11 +64,12 @@ int main(){
 
     while(1){
         scanf("%s", (unsigned char *) &host);
-        // strcpy((char *)host, "academy.networkchuck.com");
         dns = getHostByNameAndDest(host, qtype, dest);
         if (dns != NULL)
             printf("The IP address of %s is : %s\n", host, dns->rdata);
     }
+
+    cleanup_openssl();
     printf("END!!!");
     return 0;
 }
@@ -54,21 +82,15 @@ void printRecords(dns_resource_record_t *answer, int count){
 	}
 }
 
-dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest){
-	unsigned char buf[65536], *qname, *reader, ipv4[INET_ADDRSTRLEN];
-	dns_header_t *header;
-	dns_query_info_t *qinfo;
-
-	int socket_desc, i, j, gain, dest_len, query_len = 0;
+int sendQueryViaUDP(unsigned char *buf, int query_len, unsigned char *dest){
+	int socket_desc, dest_len;
 	struct sockaddr_in dest_addr;
 	struct timeval timeout;
-
-	dns_resource_record_t answer[16], auth[16], addit[16], *result = NULL;
 
 	socket_desc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (socket_desc == -1){
 		printf("Socket creation failed : %s...\n", strerror(errno));
-		return NULL;
+		return -1;
 	}
 
 	// Set receive timeout
@@ -76,32 +98,179 @@ dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsi
     timeout.tv_usec = 0;
     if (setsockopt(socket_desc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
         perror("Error setting socket timeout");
-		goto resmark;
+		close(socket_desc);
+		return -1;
     }
 
 	dest_addr.sin_family = AF_INET;
 	dest_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, dest, &dest_addr.sin_addr) <= 0) {
         printf("Invalid DNS resolver address: %s\n", dest);
-		goto resmark;
+		close(socket_desc);
+		return -1;
     }
 
 	dest_len = sizeof(dest_addr);
 
-	packDNSQuery(host, qtype, buf, &query_len, &header);
-
 	if (sendto(socket_desc, (char *)buf, query_len, 0, (struct sockaddr *) &dest_addr, (socklen_t) dest_len) < 0)
 	{
 		perror("Error sending query");
-		goto resmark;
+		close(socket_desc);
+		return -1;
 	}
 	printf("DNS query sent\n");
 
 	if (recvfrom(socket_desc, (char *)buf, 65535, 0, (struct sockaddr *) &dest_addr, (socklen_t *) &dest_len) < 0){
 		perror("Error receiving query response");
-		goto resmark;
+		close(socket_desc);
+		return -1;
 	}
 	printf("DNS query response received successfully\n");
+	return 0;
+}
+
+int sendQueryViaTCP(unsigned char *buf, int query_len, unsigned char *dest){
+	int socket_desc, dest_len;
+	struct sockaddr_in dest_addr;
+	struct timeval timeout;
+
+	socket_desc = socket(AF_INET, SOCK_STREAM, 0);
+	if (socket_desc == -1){
+		printf("Socket creation failed : %s...\n", strerror(errno));
+		return -1;
+	}
+
+	// Set receive timeout
+    timeout.tv_sec = 15;  // 15 second timeout
+    timeout.tv_usec = 0;
+    if (setsockopt(socket_desc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Error setting socket timeout");
+		close(socket_desc);
+		return -1;
+    }
+
+	dest_addr.sin_family = AF_INET;
+	dest_addr.sin_port = htons(PORT);
+    if (inet_pton(AF_INET, dest, &dest_addr.sin_addr) <= 0) {
+        printf("Invalid DNS resolver address: %s\n", dest);
+		close(socket_desc);
+		return -1;
+    }
+	dest_len = sizeof(dest_addr);
+
+	if (connect(socket_desc, (struct sockaddr *) &dest_addr, (socklen_t) dest_len) < 0){
+		perror("Failed to connect to the server");
+		close(socket_desc);
+		return -1;
+	}
+
+	if (send(socket_desc, (char *)buf, query_len, 0) < 0){
+		perror("Failed to send query");
+		close(socket_desc);
+		return -1;
+	}
+	printf("DNS query sent successfully\n");
+
+	if (recv(socket_desc, (char *)buf, 65536, 0) <= 0){
+		perror("Failed to receive response");
+		close(socket_desc);
+		return -1;
+	}
+	printf("Query response received successfully\n");
+
+	shutdown(socket_desc, SHUT_RDWR);
+	close(socket_desc);
+	return 0;
+}
+
+int sendQueryViaTLS(unsigned char *buf, int query_len, unsigned char *dest){
+	int socket_desc, dest_len;
+	struct sockaddr_in dest_addr;
+	struct timeval timeout;
+	SSL_CTX *ctx;
+    SSL *ssl;
+
+	socket_desc = socket(AF_INET, SOCK_STREAM, 0);
+	if (socket_desc == -1){
+		printf("Socket creation failed : %s...\n", strerror(errno));
+		return -1;
+	}
+
+	// Set receive timeout
+    timeout.tv_sec = 15;  // 15 second timeout
+    timeout.tv_usec = 0;
+    if (setsockopt(socket_desc, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Error setting socket timeout");
+		close(socket_desc);
+		return -1;
+    }
+
+	dest_addr.sin_family = AF_INET;
+	dest_addr.sin_port = htons(853);
+    if (inet_pton(AF_INET, dest, &dest_addr.sin_addr) <= 0) {
+        printf("Invalid DNS resolver address: %s\n", dest);
+		close(socket_desc);
+		return -1;
+    }
+	dest_len = sizeof(dest_addr);
+
+	if (connect(socket_desc, (struct sockaddr *) &dest_addr, (socklen_t) dest_len) < 0){
+		perror("Failed to connect to the server");
+		close(socket_desc);
+		return -1;
+	}
+
+	ctx = create_context();
+	ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, socket_desc);
+
+	if (SSL_connect(ssl) <= 0){
+		ERR_print_errors_fp(stderr);
+		SSL_free(ssl);
+		close(socket_desc);
+		SSL_CTX_free(ctx);
+		cleanup_openssl();
+		return -1;
+	}
+
+	if (SSL_write(ssl, buf, query_len) <= 0){
+		perror("Error while sending response");
+		return -1;
+	}
+	printf("DNS query sent successfully vis TLS over TCP\n");
+
+	if (SSL_read(ssl, buf, 65536) <= 0){
+		ERR_print_errors_fp(stderr);
+		SSL_free(ssl);
+		close(socket_desc);
+		SSL_CTX_free(ctx);
+		cleanup_openssl();
+		return -1;
+	}
+	printf("Query response received successfully via TLS over TCP\n");
+
+	SSL_free(ssl);
+	close(socket_desc);
+	SSL_CTX_free(ctx);
+	cleanup_openssl();
+	return 0;
+}
+
+dns_resource_record_t* getHostByNameAndDest(unsigned char *host, int qtype, unsigned char *dest){
+	unsigned char buf[65536], *qname, *reader, ipv4[INET_ADDRSTRLEN];
+	dns_header_t *header;
+	dns_query_info_t *qinfo;
+
+	int i, j, gain, query_len = 0;
+
+	dns_resource_record_t answer[16], auth[16], addit[16], *result = NULL;
+
+	packDNSQuery(host, qtype, buf, &query_len, &header);
+
+	if (sendQueryViaTLS(buf, query_len, dest) < 0){
+		printf("Failed to receive response\n");
+		goto resmark;
+	}
 
 	unpackDNSResponse(buf, answer, auth, addit, &header);
 
@@ -179,7 +348,6 @@ resmark:
 			free(addit[i].rdata);
 	}
 
-	close(socket_desc);
 	return result;
 }
 

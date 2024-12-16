@@ -1,5 +1,7 @@
 #include <stdlib.h>
 #include <unistd.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define QR_MASK 	0x8000
 #define OPCODE_MASK 0x7800
@@ -52,8 +54,10 @@ typedef struct{
 } dns_resource_record_t;
 
 typedef struct {
+	int conn_type;
 	int client_id;
 	int socket_desc;
+	SSL *ssl;
 	unsigned char buf[BUF_SIZE];
 	struct sockaddr_in client_addr;
 	int client_addr_len;
